@@ -41,6 +41,11 @@
 
 const char *SDS_NOINIT = "SDS_NOINIT";
 
+/**
+ * return size of sds header size
+ * @param type
+ * @return
+ */
 static inline int sdsHdrSize(char type) {
     switch(type&SDS_TYPE_MASK) {
         case SDS_TYPE_5:
@@ -102,14 +107,27 @@ sds sdsnewlen(const void *init, size_t initlen) {
     else if (!init)
         memset(sh, 0, hdrlen+initlen+1);
     if (sh == NULL) return NULL;
+    /* ptr to init */
     s = (char*)sh+hdrlen;
+    /* ptr to header's last byte */
     fp = ((unsigned char*)s)-1;
     switch(type) {
         case SDS_TYPE_5: {
+            /*
+             * -----------------
+             * |b|b|b|b|b|b|b|b|
+             * -----------------
+             * | initlen | type|
+             * total 8 bit
+             */
             *fp = type | (initlen << SDS_TYPE_BITS);
             break;
         }
+        /* #define SDS_HDR_VAR(T,s) struct sdshdr##T *sh = (void*)((s)-(sizeof(struct sdshdr##T))); */
         case SDS_TYPE_8: {
+            /*
+             * struct sdshdr8 *sh = (void*)((s)-(sizeof(struct sdshdr8)));
+             */
             SDS_HDR_VAR(8,s);
             sh->len = initlen;
             sh->alloc = initlen;
@@ -138,6 +156,7 @@ sds sdsnewlen(const void *init, size_t initlen) {
             break;
         }
     }
+    /* copy init string */
     if (initlen && init)
         memcpy(s, init, initlen);
     s[initlen] = '\0';

@@ -77,6 +77,7 @@ void zlibc_free(void *ptr) {
     atomicIncr(used_memory,__n); \
 } while(0)
 
+//  更新已使用的内存大小
 #define update_zmalloc_stat_free(__n) do { \
     size_t _n = (__n); \
     if (_n&(sizeof(long)-1)) _n += sizeof(long)-(_n&(sizeof(long)-1)); \
@@ -95,6 +96,17 @@ static void zmalloc_default_oom(size_t size) {
 
 static void (*zmalloc_oom_handler)(size_t) = zmalloc_default_oom;
 
+/**
+ * malloc more sizeof(size_t) bytes
+ * it stores size
+ * -------------------------
+ * | sizeof(size_t) | size |
+ * -------------------------
+ *                  ^
+ *         return  ptr
+ * @param size
+ * @return
+ */
 void *zmalloc(size_t size) {
     void *ptr = malloc(size+PREFIX_SIZE);
 

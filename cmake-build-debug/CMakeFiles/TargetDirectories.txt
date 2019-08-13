@@ -1,0 +1,3 @@
+/Users/Double/Documents/source/redis/cmake-build-debug/CMakeFiles/rebuild_cache.dir
+/Users/Double/Documents/source/redis/cmake-build-debug/CMakeFiles/edit_cache.dir
+/Users/Double/Documents/source/redis/cmake-build-debug/CMakeFiles/redis.dir
