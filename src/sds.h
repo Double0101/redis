@@ -42,6 +42,10 @@ const char *SDS_NOINIT;
 
 typedef char *sds;
 
+/**
+ * As a special case, the last element of a structure with more than one named member may have an incomplete array type;
+ * this is called a flexible array member. In most situations, the flexible array member is ignored.
+ */
 /* Note: sdshdr5 is never used, we just access the flags byte directly.
  * However is here to document the layout of type 5 SDS strings. */
 /* length < 1<<5 */
