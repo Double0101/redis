@@ -45,6 +45,7 @@ typedef char *sds;
 /**
  * As a special case, the last element of a structure with more than one named member may have an incomplete array type;
  * this is called a flexible array member. In most situations, the flexible array member is ignored.
+ * url: https://stackoverflow.com/questions/36577094/array-of-size-0-at-the-end-of-struct
  */
 /* Note: sdshdr5 is never used, we just access the flags byte directly.
  * However is here to document the layout of type 5 SDS strings. */
@@ -137,6 +138,11 @@ static inline size_t sdsavail(const sds s) {
     return 0;
 }
 
+/**
+ * set sds len
+ * @param s
+ * @param newlen
+ */
 static inline void sdssetlen(sds s, size_t newlen) {
     unsigned char flags = s[-1];
     switch(flags&SDS_TYPE_MASK) {
@@ -161,6 +167,11 @@ static inline void sdssetlen(sds s, size_t newlen) {
     }
 }
 
+/**
+ * increase sds len
+ * @param s
+ * @param inc
+ */
 static inline void sdsinclen(sds s, size_t inc) {
     unsigned char flags = s[-1];
     switch(flags&SDS_TYPE_MASK) {
