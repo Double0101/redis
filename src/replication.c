@@ -264,7 +264,7 @@ void replicationFeedSlaves(list *slaves, int dictid, robj **argv, int argc) {
          * or are already in sync with the master. */
 
         /* Add the multi bulk length. */
-        addReplyArrayLen(slave,argc);
+        addReplyMultiBulkLen(slave,argc);
 
         /* Finally any additional argument that was not stored inside the
          * static buffer if any (from j to argc). */
@@ -297,7 +297,7 @@ void replicationFeedSlavesFromMasterStream(list *slaves, char *buf, size_t bufle
 
         /* Don't feed slaves that are still waiting for BGSAVE to start */
         if (slave->replstate == SLAVE_STATE_WAIT_BGSAVE_START) continue;
-        addReplyProto(slave,buf,buflen);
+        addReplyString(slave,buf,buflen);
     }
 }
 
@@ -823,9 +823,7 @@ void replconfCommand(client *c) {
             c->repl_ack_time = server.unixtime;
             /* If this was a diskless replication, we need to really put
              * the slave online when the first ACK is received (which
-             * confirms slave is online and ready to get more data). This
-             * allows for simpler and less CPU intensive EOF detection
-             * when streaming RDB files. */
+             * confirms slave is online and ready to get more data). */
             if (c->repl_put_online_on_ack && c->replstate == SLAVE_STATE_ONLINE)
                 putSlaveOnline(c);
             /* Note: this command does not reply anything! */
@@ -844,20 +842,18 @@ void replconfCommand(client *c) {
     addReply(c,shared.ok);
 }
 
-/* This function puts a replica in the online state, and should be called just
- * after a replica received the RDB file for the initial synchronization, and
+/* This function puts a slave in the online state, and should be called just
+ * after a slave received the RDB file for the initial synchronization, and
  * we are finally ready to send the incremental stream of commands.
  *
  * It does a few things:
  *
- * 1) Put the slave in ONLINE state. Note that the function may also be called
- *    for a replicas that are already in ONLINE state, but having the flag
- *    repl_put_online_on_ack set to true: we still have to install the write
- *    handler in that case. This function will take care of that.
+ * 1) Put the slave in ONLINE state (useless when the function is called
+ *    because state is already ONLINE but repl_put_online_on_ack is true).
  * 2) Make sure the writable event is re-installed, since calling the SYNC
  *    command disables it, so that we can accumulate output buffer without
- *    sending it to the replica.
- * 3) Update the count of "good replicas". */
+ *    sending it to the slave.
+ * 3) Update the count of good slaves. */
 void putSlaveOnline(client *slave) {
     slave->replstate = SLAVE_STATE_ONLINE;
     slave->repl_put_online_on_ack = 0;
@@ -969,31 +965,11 @@ void updateSlavesWaitingBgsave(int bgsaveerr, int type) {
                 serverLog(LL_NOTICE,
                     "Streamed RDB transfer with replica %s succeeded (socket). Waiting for REPLCONF ACK from slave to enable streaming",
                         replicationGetSlaveName(slave));
-                /* Note: we wait for a REPLCONF ACK message from the replica in
+                /* Note: we wait for a REPLCONF ACK message from slave in
                  * order to really put it online (install the write handler
                  * so that the accumulated data can be transferred). However
                  * we change the replication state ASAP, since our slave
-                 * is technically online now.
-                 *
-                 * So things work like that:
-                 *
-                 * 1. We end trasnferring the RDB file via socket.
-                 * 2. The replica is put ONLINE but the write handler
-                 *    is not installed.
-                 * 3. The replica however goes really online, and pings us
-                 *    back via REPLCONF ACK commands.
-                 * 4. Now we finally install the write handler, and send
-                 *    the buffers accumulated so far to the replica.
-                 *
-                 * But why we do that? Because the replica, when we stream
-                 * the RDB directly via the socket, must detect the RDB
-                 * EOF (end of file), that is a special random string at the
-                 * end of the RDB (for streamed RDBs we don't know the length
-                 * in advance). Detecting such final EOF string is much
-                 * simpler and less CPU intensive if no more data is sent
-                 * after such final EOF. So we don't want to glue the end of
-                 * the RDB trasfer with the start of the other replication
-                 * data. */
+                 * is technically online now. */
                 slave->replstate = SLAVE_STATE_ONLINE;
                 slave->repl_put_online_on_ack = 1;
                 slave->repl_ack_time = server.unixtime; /* Timeout otherwise. */
@@ -1106,7 +1082,6 @@ void replicationCreateMasterClient(int fd, int dbid) {
     server.master->authenticated = 1;
     server.master->reploff = server.master_initial_offset;
     server.master->read_reploff = server.master->reploff;
-    server.master->user = NULL; /* This client can do everything. */
     memcpy(server.master->replid, server.master_replid,
         sizeof(server.master_replid));
     /* If master offset is set to -1, this master is old and is not
@@ -1137,65 +1112,11 @@ void restartAOFAfterSYNC() {
     }
 }
 
-static int useDisklessLoad() {
-    /* compute boolean decision to use diskless load */
-    return server.repl_diskless_load == REPL_DISKLESS_LOAD_SWAPDB ||
-           (server.repl_diskless_load == REPL_DISKLESS_LOAD_WHEN_DB_EMPTY && dbTotalServerKeyCount()==0);
-}
-
-/* Helper function for readSyncBulkPayload() to make backups of the current
- * DBs before socket-loading the new ones. The backups may be restored later
- * or freed by disklessLoadRestoreBackups(). */
-redisDb *disklessLoadMakeBackups(void) {
-    redisDb *backups = zmalloc(sizeof(redisDb)*server.dbnum);
-    for (int i=0; i<server.dbnum; i++) {
-        backups[i] = server.db[i];
-        server.db[i].dict = dictCreate(&dbDictType,NULL);
-        server.db[i].expires = dictCreate(&keyptrDictType,NULL);
-    }
-    return backups;
-}
-
-/* Helper function for readSyncBulkPayload(): when replica-side diskless
- * database loading is used, Redis makes a backup of the existing databases
- * before loading the new ones from the socket.
- *
- * If the socket loading went wrong, we want to restore the old backups
- * into the server databases. This function does just that in the case
- * the 'restore' argument (the number of DBs to replace) is non-zero.
- *
- * When instead the loading succeeded we want just to free our old backups,
- * in that case the funciton will do just that when 'restore' is 0. */
-void disklessLoadRestoreBackups(redisDb *backup, int restore, int empty_db_flags)
-{
-    if (restore) {
-        /* Restore. */
-        emptyDbGeneric(server.db,-1,empty_db_flags,replicationEmptyDbCallback);
-        for (int i=0; i<server.dbnum; i++) {
-            dictRelease(server.db[i].dict);
-            dictRelease(server.db[i].expires);
-            server.db[i] = backup[i];
-        }
-    } else {
-        /* Delete. */
-        emptyDbGeneric(backup,-1,empty_db_flags,replicationEmptyDbCallback);
-        for (int i=0; i<server.dbnum; i++) {
-            dictRelease(backup[i].dict);
-            dictRelease(backup[i].expires);
-        }
-    }
-    zfree(backup);
-}
-
 /* Asynchronously read the SYNC payload we receive from a master */
 #define REPL_MAX_WRITTEN_BEFORE_FSYNC (1024*1024*8) /* 8 MB */
 void readSyncBulkPayload(aeEventLoop *el, int fd, void *privdata, int mask) {
     char buf[4096];
     ssize_t nread, readlen, nwritten;
-    int use_diskless_load;
-    redisDb *diskless_load_backup = NULL;
-    int empty_db_flags = server.repl_slave_lazy_flush ? EMPTYDB_ASYNC :
-                                                        EMPTYDB_NO_FLAGS;
     off_t left;
     UNUSED(el);
     UNUSED(privdata);
@@ -1251,202 +1172,90 @@ void readSyncBulkPayload(aeEventLoop *el, int fd, void *privdata, int mask) {
              * at the next call. */
             server.repl_transfer_size = 0;
             serverLog(LL_NOTICE,
-                "MASTER <-> REPLICA sync: receiving streamed RDB from master with EOF %s",
-                useDisklessLoad()? "to parser":"to disk");
+                "MASTER <-> REPLICA sync: receiving streamed RDB from master");
         } else {
             usemark = 0;
             server.repl_transfer_size = strtol(buf+1,NULL,10);
             serverLog(LL_NOTICE,
-                "MASTER <-> REPLICA sync: receiving %lld bytes from master %s",
-                (long long) server.repl_transfer_size,
-                useDisklessLoad()? "to parser":"to disk");
+                "MASTER <-> REPLICA sync: receiving %lld bytes from master",
+                (long long) server.repl_transfer_size);
         }
         return;
     }
 
-    use_diskless_load = useDisklessLoad();
-    if (!use_diskless_load) {
-        /* Read the data from the socket, store it to a file and search
-         * for the EOF. */
-        if (usemark) {
-            readlen = sizeof(buf);
+    /* Read bulk data */
+    if (usemark) {
+        readlen = sizeof(buf);
+    } else {
+        left = server.repl_transfer_size - server.repl_transfer_read;
+        readlen = (left < (signed)sizeof(buf)) ? left : (signed)sizeof(buf);
+    }
+
+    nread = read(fd,buf,readlen);
+    if (nread <= 0) {
+        serverLog(LL_WARNING,"I/O error trying to sync with MASTER: %s",
+            (nread == -1) ? strerror(errno) : "connection lost");
+        cancelReplicationHandshake();
+        return;
+    }
+    server.stat_net_input_bytes += nread;
+
+    /* When a mark is used, we want to detect EOF asap in order to avoid
+     * writing the EOF mark into the file... */
+    int eof_reached = 0;
+
+    if (usemark) {
+        /* Update the last bytes array, and check if it matches our delimiter.*/
+        if (nread >= CONFIG_RUN_ID_SIZE) {
+            memcpy(lastbytes,buf+nread-CONFIG_RUN_ID_SIZE,CONFIG_RUN_ID_SIZE);
         } else {
-            left = server.repl_transfer_size - server.repl_transfer_read;
-            readlen = (left < (signed)sizeof(buf)) ? left : (signed)sizeof(buf);
+            int rem = CONFIG_RUN_ID_SIZE-nread;
+            memmove(lastbytes,lastbytes+nread,rem);
+            memcpy(lastbytes+rem,buf,nread);
         }
+        if (memcmp(lastbytes,eofmark,CONFIG_RUN_ID_SIZE) == 0) eof_reached = 1;
+    }
 
-        nread = read(fd,buf,readlen);
-        if (nread <= 0) {
-            serverLog(LL_WARNING,"I/O error trying to sync with MASTER: %s",
-                (nread == -1) ? strerror(errno) : "connection lost");
-            cancelReplicationHandshake();
-            return;
-        }
-        server.stat_net_input_bytes += nread;
+    server.repl_transfer_lastio = server.unixtime;
+    if ((nwritten = write(server.repl_transfer_fd,buf,nread)) != nread) {
+        serverLog(LL_WARNING,"Write error or short write writing to the DB dump file needed for MASTER <-> REPLICA synchronization: %s", 
+            (nwritten == -1) ? strerror(errno) : "short write");
+        goto error;
+    }
+    server.repl_transfer_read += nread;
 
-        /* When a mark is used, we want to detect EOF asap in order to avoid
-         * writing the EOF mark into the file... */
-        int eof_reached = 0;
-
-        if (usemark) {
-            /* Update the last bytes array, and check if it matches our
-             * delimiter. */
-            if (nread >= CONFIG_RUN_ID_SIZE) {
-                memcpy(lastbytes,buf+nread-CONFIG_RUN_ID_SIZE,
-                       CONFIG_RUN_ID_SIZE);
-            } else {
-                int rem = CONFIG_RUN_ID_SIZE-nread;
-                memmove(lastbytes,lastbytes+nread,rem);
-                memcpy(lastbytes+rem,buf,nread);
-            }
-            if (memcmp(lastbytes,eofmark,CONFIG_RUN_ID_SIZE) == 0)
-                eof_reached = 1;
-        }
-
-        /* Update the last I/O time for the replication transfer (used in
-         * order to detect timeouts during replication), and write what we
-         * got from the socket to the dump file on disk. */
-        server.repl_transfer_lastio = server.unixtime;
-        if ((nwritten = write(server.repl_transfer_fd,buf,nread)) != nread) {
-            serverLog(LL_WARNING,
-                "Write error or short write writing to the DB dump file "
-                "needed for MASTER <-> REPLICA synchronization: %s",
-                (nwritten == -1) ? strerror(errno) : "short write");
+    /* Delete the last 40 bytes from the file if we reached EOF. */
+    if (usemark && eof_reached) {
+        if (ftruncate(server.repl_transfer_fd,
+            server.repl_transfer_read - CONFIG_RUN_ID_SIZE) == -1)
+        {
+            serverLog(LL_WARNING,"Error truncating the RDB file received from the master for SYNC: %s", strerror(errno));
             goto error;
         }
-        server.repl_transfer_read += nread;
-
-        /* Delete the last 40 bytes from the file if we reached EOF. */
-        if (usemark && eof_reached) {
-            if (ftruncate(server.repl_transfer_fd,
-                server.repl_transfer_read - CONFIG_RUN_ID_SIZE) == -1)
-            {
-                serverLog(LL_WARNING,
-                    "Error truncating the RDB file received from the master "
-                    "for SYNC: %s", strerror(errno));
-                goto error;
-            }
-        }
-
-        /* Sync data on disk from time to time, otherwise at the end of the
-         * transfer we may suffer a big delay as the memory buffers are copied
-         * into the actual disk. */
-        if (server.repl_transfer_read >=
-            server.repl_transfer_last_fsync_off + REPL_MAX_WRITTEN_BEFORE_FSYNC)
-        {
-            off_t sync_size = server.repl_transfer_read -
-                              server.repl_transfer_last_fsync_off;
-            rdb_fsync_range(server.repl_transfer_fd,
-                server.repl_transfer_last_fsync_off, sync_size);
-            server.repl_transfer_last_fsync_off += sync_size;
-        }
-
-        /* Check if the transfer is now complete */
-        if (!usemark) {
-            if (server.repl_transfer_read == server.repl_transfer_size)
-                eof_reached = 1;
-        }
-
-        /* If the transfer is yet not complete, we need to read more, so
-         * return ASAP and wait for the handler to be called again. */
-        if (!eof_reached) return;
     }
 
-    /* We reach this point in one of the following cases:
-     *
-     * 1. The replica is using diskless replication, that is, it reads data
-     *    directly from the socket to the Redis memory, without using
-     *    a temporary RDB file on disk. In that case we just block and
-     *    read everything from the socket.
-     *
-     * 2. Or when we are done reading from the socket to the RDB file, in
-     *    such case we want just to read the RDB file in memory. */
-    serverLog(LL_NOTICE, "MASTER <-> REPLICA sync: Flushing old data");
-
-    /* We need to stop any AOF rewriting child before flusing and parsing
-     * the RDB, otherwise we'll create a copy-on-write disaster. */
-    if (server.aof_state != AOF_OFF) stopAppendOnly();
-    signalFlushedDb(-1);
-
-    /* When diskless RDB loading is used by replicas, it may be configured
-     * in order to save the current DB instead of throwing it away,
-     * so that we can restore it in case of failed transfer. */
-    if (use_diskless_load &&
-        server.repl_diskless_load == REPL_DISKLESS_LOAD_SWAPDB)
+    /* Sync data on disk from time to time, otherwise at the end of the transfer
+     * we may suffer a big delay as the memory buffers are copied into the
+     * actual disk. */
+    if (server.repl_transfer_read >=
+        server.repl_transfer_last_fsync_off + REPL_MAX_WRITTEN_BEFORE_FSYNC)
     {
-        diskless_load_backup = disklessLoadMakeBackups();
-    } else {
-        emptyDb(-1,empty_db_flags,replicationEmptyDbCallback);
+        off_t sync_size = server.repl_transfer_read -
+                          server.repl_transfer_last_fsync_off;
+        rdb_fsync_range(server.repl_transfer_fd,
+            server.repl_transfer_last_fsync_off, sync_size);
+        server.repl_transfer_last_fsync_off += sync_size;
     }
 
-    /* Before loading the DB into memory we need to delete the readable
-     * handler, otherwise it will get called recursively since
-     * rdbLoad() will call the event loop to process events from time to
-     * time for non blocking loading. */
-    aeDeleteFileEvent(server.el,server.repl_transfer_s,AE_READABLE);
-    serverLog(LL_NOTICE, "MASTER <-> REPLICA sync: Loading DB in memory");
-    rdbSaveInfo rsi = RDB_SAVE_INFO_INIT;
-    if (use_diskless_load) {
-        rio rdb;
-        rioInitWithFd(&rdb,fd,server.repl_transfer_size);
+    /* Check if the transfer is now complete */
+    if (!usemark) {
+        if (server.repl_transfer_read == server.repl_transfer_size)
+            eof_reached = 1;
+    }
 
-        /* Put the socket in blocking mode to simplify RDB transfer.
-         * We'll restore it when the RDB is received. */
-        anetBlock(NULL,fd);
-        anetRecvTimeout(NULL,fd,server.repl_timeout*1000);
-        startLoading(server.repl_transfer_size);
+    if (eof_reached) {
+        int aof_is_enabled = server.aof_state != AOF_OFF;
 
-        if (rdbLoadRio(&rdb,&rsi,0) != C_OK) {
-            /* RDB loading failed. */
-            stopLoading();
-            serverLog(LL_WARNING,
-                "Failed trying to load the MASTER synchronization DB "
-                "from socket");
-            cancelReplicationHandshake();
-            rioFreeFd(&rdb, NULL);
-            if (server.repl_diskless_load == REPL_DISKLESS_LOAD_SWAPDB) {
-                /* Restore the backed up databases. */
-                disklessLoadRestoreBackups(diskless_load_backup,1,
-                                           empty_db_flags);
-            } else {
-                /* Remove the half-loaded data in case we started with
-                 * an empty replica. */
-                emptyDb(-1,empty_db_flags,replicationEmptyDbCallback);
-            }
-
-            /* Note that there's no point in restarting the AOF on SYNC
-             * failure, it'll be restarted when sync succeeds or the replica
-             * gets promoted. */
-            return;
-        }
-        stopLoading();
-
-        /* RDB loading succeeded if we reach this point. */
-        if (server.repl_diskless_load == REPL_DISKLESS_LOAD_SWAPDB) {
-            /* Delete the backup databases we created before starting to load
-             * the new RDB. Now the RDB was loaded with success so the old
-             * data is useless. */
-            disklessLoadRestoreBackups(diskless_load_backup,0,empty_db_flags);
-        }
-
-        /* Verify the end mark is correct. */
-        if (usemark) {
-            if (!rioRead(&rdb,buf,CONFIG_RUN_ID_SIZE) ||
-                memcmp(buf,eofmark,CONFIG_RUN_ID_SIZE) != 0)
-            {
-                serverLog(LL_WARNING,"Replication stream EOF marker is broken");
-                cancelReplicationHandshake();
-                rioFreeFd(&rdb, NULL);
-                return;
-            }
-        }
-
-        /* Cleanup and restore the socket to the original state to continue
-         * with the normal replication. */
-        rioFreeFd(&rdb, NULL);
-        anetNonBlock(NULL,fd);
-        anetRecvTimeout(NULL,fd,0);
-    } else {
         /* Ensure background save doesn't overwrite synced data */
         if (server.rdb_child_pid != -1) {
             serverLog(LL_NOTICE,
@@ -1455,57 +1264,63 @@ void readSyncBulkPayload(aeEventLoop *el, int fd, void *privdata, int mask) {
                 "Killing process %ld and removing its temp file to avoid "
                 "any race",
                     (long) server.rdb_child_pid);
-            killRDBChild();
+            kill(server.rdb_child_pid,SIGUSR1);
+            rdbRemoveTempFile(server.rdb_child_pid);
         }
 
         if (rename(server.repl_transfer_tmpfile,server.rdb_filename) == -1) {
-            serverLog(LL_WARNING,
-                "Failed trying to rename the temp DB into %s in "
-                "MASTER <-> REPLICA synchronization: %s",
-                server.rdb_filename, strerror(errno));
+            serverLog(LL_WARNING,"Failed trying to rename the temp DB into dump.rdb in MASTER <-> REPLICA synchronization: %s", strerror(errno));
             cancelReplicationHandshake();
             return;
         }
+        serverLog(LL_NOTICE, "MASTER <-> REPLICA sync: Flushing old data");
+        /* We need to stop any AOFRW fork before flusing and parsing
+         * RDB, otherwise we'll create a copy-on-write disaster. */
+        if(aof_is_enabled) stopAppendOnly();
+        signalFlushedDb(-1);
+        emptyDb(
+            -1,
+            server.repl_slave_lazy_flush ? EMPTYDB_ASYNC : EMPTYDB_NO_FLAGS,
+            replicationEmptyDbCallback);
+        /* Before loading the DB into memory we need to delete the readable
+         * handler, otherwise it will get called recursively since
+         * rdbLoad() will call the event loop to process events from time to
+         * time for non blocking loading. */
+        aeDeleteFileEvent(server.el,server.repl_transfer_s,AE_READABLE);
+        serverLog(LL_NOTICE, "MASTER <-> REPLICA sync: Loading DB in memory");
+        rdbSaveInfo rsi = RDB_SAVE_INFO_INIT;
         if (rdbLoad(server.rdb_filename,&rsi) != C_OK) {
-            serverLog(LL_WARNING,
-                "Failed trying to load the MASTER synchronization "
-                "DB from disk");
+            serverLog(LL_WARNING,"Failed trying to load the MASTER synchronization DB from disk");
             cancelReplicationHandshake();
-            /* Note that there's no point in restarting the AOF on sync failure,
-               it'll be restarted when sync succeeds or replica promoted. */
+            /* Re-enable the AOF if we disabled it earlier, in order to restore
+             * the original configuration. */
+            if (aof_is_enabled) restartAOFAfterSYNC();
             return;
         }
-
-        /* Cleanup. */
+        /* Final setup of the connected slave <- master link */
         zfree(server.repl_transfer_tmpfile);
         close(server.repl_transfer_fd);
-        server.repl_transfer_fd = -1;
-        server.repl_transfer_tmpfile = NULL;
+        replicationCreateMasterClient(server.repl_transfer_s,rsi.repl_stream_db);
+        server.repl_state = REPL_STATE_CONNECTED;
+        server.repl_down_since = 0;
+        /* After a full resynchroniziation we use the replication ID and
+         * offset of the master. The secondary ID / offset are cleared since
+         * we are starting a new history. */
+        memcpy(server.replid,server.master->replid,sizeof(server.replid));
+        server.master_repl_offset = server.master->reploff;
+        clearReplicationId2();
+        /* Let's create the replication backlog if needed. Slaves need to
+         * accumulate the backlog regardless of the fact they have sub-slaves
+         * or not, in order to behave correctly if they are promoted to
+         * masters after a failover. */
+        if (server.repl_backlog == NULL) createReplicationBacklog();
+
+        serverLog(LL_NOTICE, "MASTER <-> REPLICA sync: Finished with success");
+        /* Restart the AOF subsystem now that we finished the sync. This
+         * will trigger an AOF rewrite, and when done will start appending
+         * to the new file. */
+        if (aof_is_enabled) restartAOFAfterSYNC();
     }
-
-    /* Final setup of the connected slave <- master link */
-    replicationCreateMasterClient(server.repl_transfer_s,rsi.repl_stream_db);
-    server.repl_state = REPL_STATE_CONNECTED;
-    server.repl_down_since = 0;
-
-    /* After a full resynchroniziation we use the replication ID and
-     * offset of the master. The secondary ID / offset are cleared since
-     * we are starting a new history. */
-    memcpy(server.replid,server.master->replid,sizeof(server.replid));
-    server.master_repl_offset = server.master->reploff;
-    clearReplicationId2();
-
-    /* Let's create the replication backlog if needed. Slaves need to
-     * accumulate the backlog regardless of the fact they have sub-slaves
-     * or not, in order to behave correctly if they are promoted to
-     * masters after a failover. */
-    if (server.repl_backlog == NULL) createReplicationBacklog();
-    serverLog(LL_NOTICE, "MASTER <-> REPLICA sync: Finished with success");
-
-    /* Restart the AOF subsystem now that we finished the sync. This
-     * will trigger an AOF rewrite, and when done will start appending
-     * to the new file. */
-    if (server.aof_enabled) restartAOFAfterSYNC();
     return;
 
 error:
@@ -1856,13 +1671,7 @@ void syncWithMaster(aeEventLoop *el, int fd, void *privdata, int mask) {
 
     /* AUTH with the master if required. */
     if (server.repl_state == REPL_STATE_SEND_AUTH) {
-        if (server.masteruser && server.masterauth) {
-            err = sendSynchronousCommand(SYNC_CMD_WRITE,fd,"AUTH",
-                                         server.masteruser,server.masterauth,NULL);
-            if (err) goto write_error;
-            server.repl_state = REPL_STATE_RECEIVE_AUTH;
-            return;
-        } else if (server.masterauth) {
+        if (server.masterauth) {
             err = sendSynchronousCommand(SYNC_CMD_WRITE,fd,"AUTH",server.masterauth,NULL);
             if (err) goto write_error;
             server.repl_state = REPL_STATE_RECEIVE_AUTH;
@@ -2029,20 +1838,16 @@ void syncWithMaster(aeEventLoop *el, int fd, void *privdata, int mask) {
     }
 
     /* Prepare a suitable temp file for bulk transfer */
-    if (!useDisklessLoad()) {
-        while(maxtries--) {
-            snprintf(tmpfile,256,
-                "temp-%d.%ld.rdb",(int)server.unixtime,(long int)getpid());
-            dfd = open(tmpfile,O_CREAT|O_WRONLY|O_EXCL,0644);
-            if (dfd != -1) break;
-            sleep(1);
-        }
-        if (dfd == -1) {
-            serverLog(LL_WARNING,"Opening the temp file needed for MASTER <-> REPLICA synchronization: %s",strerror(errno));
-            goto error;
-        }
-        server.repl_transfer_tmpfile = zstrdup(tmpfile);
-        server.repl_transfer_fd = dfd;
+    while(maxtries--) {
+        snprintf(tmpfile,256,
+            "temp-%d.%ld.rdb",(int)server.unixtime,(long int)getpid());
+        dfd = open(tmpfile,O_CREAT|O_WRONLY|O_EXCL,0644);
+        if (dfd != -1) break;
+        sleep(1);
+    }
+    if (dfd == -1) {
+        serverLog(LL_WARNING,"Opening the temp file needed for MASTER <-> REPLICA synchronization: %s",strerror(errno));
+        goto error;
     }
 
     /* Setup the non blocking download of the bulk file. */
@@ -2059,19 +1864,15 @@ void syncWithMaster(aeEventLoop *el, int fd, void *privdata, int mask) {
     server.repl_transfer_size = -1;
     server.repl_transfer_read = 0;
     server.repl_transfer_last_fsync_off = 0;
+    server.repl_transfer_fd = dfd;
     server.repl_transfer_lastio = server.unixtime;
+    server.repl_transfer_tmpfile = zstrdup(tmpfile);
     return;
 
 error:
     aeDeleteFileEvent(server.el,fd,AE_READABLE|AE_WRITABLE);
     if (dfd != -1) close(dfd);
     close(fd);
-    if (server.repl_transfer_fd != -1)
-        close(server.repl_transfer_fd);
-    if (server.repl_transfer_tmpfile)
-        zfree(server.repl_transfer_tmpfile);
-    server.repl_transfer_tmpfile = NULL;
-    server.repl_transfer_fd = -1;
     server.repl_transfer_s = -1;
     server.repl_state = REPL_STATE_CONNECT;
     return;
@@ -2125,13 +1926,9 @@ void undoConnectWithMaster(void) {
 void replicationAbortSyncTransfer(void) {
     serverAssert(server.repl_state == REPL_STATE_TRANSFER);
     undoConnectWithMaster();
-    if (server.repl_transfer_fd!=-1) {
-        close(server.repl_transfer_fd);
-        unlink(server.repl_transfer_tmpfile);
-        zfree(server.repl_transfer_tmpfile);
-        server.repl_transfer_tmpfile = NULL;
-        server.repl_transfer_fd = -1;
-    }
+    close(server.repl_transfer_fd);
+    unlink(server.repl_transfer_tmpfile);
+    zfree(server.repl_transfer_tmpfile);
 }
 
 /* This function aborts a non blocking replication attempt if there is one
@@ -2241,9 +2038,6 @@ void replicaofCommand(client *c) {
             serverLog(LL_NOTICE,"MASTER MODE enabled (user request from '%s')",
                 client);
             sdsfree(client);
-            /* Restart the AOF subsystem in case we shut it down during a sync when
-             * we were still a slave. */
-            if (server.aof_enabled && server.aof_state == AOF_OFF) restartAOFAfterSYNC();
         }
     } else {
         long port;
@@ -2263,11 +2057,8 @@ void replicaofCommand(client *c) {
         /* Check if we are already attached to the specified slave */
         if (server.masterhost && !strcasecmp(server.masterhost,c->argv[1]->ptr)
             && server.masterport == port) {
-            serverLog(LL_NOTICE,"REPLICAOF would result into synchronization "
-                                "with the master we are already connected "
-                                "with. No operation performed.");
-            addReplySds(c,sdsnew("+OK Already connected to specified "
-                                 "master\r\n"));
+            serverLog(LL_NOTICE,"REPLICAOF would result into synchronization with the master we are already connected with. No operation performed.");
+            addReplySds(c,sdsnew("+OK Already connected to specified master\r\n"));
             return;
         }
         /* There was no previous master or the user specified a different one,
@@ -2291,10 +2082,10 @@ void roleCommand(client *c) {
         void *mbcount;
         int slaves = 0;
 
-        addReplyArrayLen(c,3);
+        addReplyMultiBulkLen(c,3);
         addReplyBulkCBuffer(c,"master",6);
         addReplyLongLong(c,server.master_repl_offset);
-        mbcount = addReplyDeferredLen(c);
+        mbcount = addDeferredMultiBulkLength(c);
         listRewind(server.slaves,&li);
         while((ln = listNext(&li))) {
             client *slave = ln->value;
@@ -2306,17 +2097,17 @@ void roleCommand(client *c) {
                 slaveip = ip;
             }
             if (slave->replstate != SLAVE_STATE_ONLINE) continue;
-            addReplyArrayLen(c,3);
+            addReplyMultiBulkLen(c,3);
             addReplyBulkCString(c,slaveip);
             addReplyBulkLongLong(c,slave->slave_listening_port);
             addReplyBulkLongLong(c,slave->repl_ack_off);
             slaves++;
         }
-        setDeferredArrayLen(c,mbcount,slaves);
+        setDeferredMultiBulkLength(c,mbcount,slaves);
     } else {
         char *slavestate = NULL;
 
-        addReplyArrayLen(c,5);
+        addReplyMultiBulkLen(c,5);
         addReplyBulkCBuffer(c,"slave",5);
         addReplyBulkCString(c,server.masterhost);
         addReplyLongLong(c,server.masterport);
@@ -2345,7 +2136,7 @@ void replicationSendAck(void) {
 
     if (c != NULL) {
         c->flags |= CLIENT_MASTER_FORCE_REPLY;
-        addReplyArrayLen(c,3);
+        addReplyMultiBulkLen(c,3);
         addReplyBulkCString(c,"REPLCONF");
         addReplyBulkCString(c,"ACK");
         addReplyBulkLongLong(c,c->reploff);

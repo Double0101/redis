@@ -154,6 +154,21 @@ void execCommand(client *c) {
         goto handle_monitor;
     }
 
+    /* If there are write commands inside the transaction, and this is a read
+     * only slave, we want to send an error. This happens when the transaction
+     * was initiated when the instance was a master or a writable replica and
+     * then the configuration changed (for example instance was turned into
+     * a replica). */
+    if (!server.loading && server.masterhost && server.repl_slave_ro &&
+        !(c->flags & CLIENT_MASTER) && c->mstate.cmd_flags & CMD_WRITE)
+    {
+        addReplyError(c,
+            "Transaction contains write commands but instance "
+            "is now a read-only slave. EXEC aborted.");
+        discardTransaction(c);
+        goto handle_monitor;
+    }
+
     /* Exec all the queued commands */
     unwatchAllKeys(c); /* Unwatch ASAP otherwise we'll waste CPU cycles */
     orig_argv = c->argv;

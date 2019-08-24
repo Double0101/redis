@@ -41,6 +41,11 @@
 
 const char *SDS_NOINIT = "SDS_NOINIT";
 
+/**
+ * return size of sds header size
+ * @param type
+ * @return
+ */
 static inline int sdsHdrSize(char type) {
     switch(type&SDS_TYPE_MASK) {
         case SDS_TYPE_5:
@@ -102,14 +107,27 @@ sds sdsnewlen(const void *init, size_t initlen) {
     else if (!init)
         memset(sh, 0, hdrlen+initlen+1);
     if (sh == NULL) return NULL;
+    /* ptr to init */
     s = (char*)sh+hdrlen;
+    /* ptr to header's last byte */
     fp = ((unsigned char*)s)-1;
     switch(type) {
         case SDS_TYPE_5: {
+            /*
+             * -----------------
+             * |b|b|b|b|b|b|b|b|
+             * -----------------
+             * | initlen | type|
+             * total 8 bit
+             */
             *fp = type | (initlen << SDS_TYPE_BITS);
             break;
         }
+        /* #define SDS_HDR_VAR(T,s) struct sdshdr##T *sh = (void*)((s)-(sizeof(struct sdshdr##T))); */
         case SDS_TYPE_8: {
+            /*
+             * struct sdshdr8 *sh = (void*)((s)-(sizeof(struct sdshdr8)));
+             */
             SDS_HDR_VAR(8,s);
             sh->len = initlen;
             sh->alloc = initlen;
@@ -138,6 +156,7 @@ sds sdsnewlen(const void *init, size_t initlen) {
             break;
         }
     }
+    /* copy init string */
     if (initlen && init)
         memcpy(s, init, initlen);
     s[initlen] = '\0';
@@ -219,6 +238,9 @@ sds sdsMakeRoomFor(sds s, size_t addlen) {
     else
         newlen += SDS_MAX_PREALLOC;
 
+    /*
+     * calculate new sds type depending on newlen
+     */
     type = sdsReqType(newlen);
 
     /* Don't use type 5: the user is appending to the string and type 5 is
@@ -330,6 +352,7 @@ void *sdsAllocPtr(sds s) {
  * ... check for nread <= 0 and handle it ...
  * sdsIncrLen(s, nread);
  */
+/* increase sds length, but cannot change sds type */
 void sdsIncrLen(sds s, ssize_t incr) {
     unsigned char flags = s[-1];
     size_t len;
@@ -384,6 +407,7 @@ sds sdsgrowzero(sds s, size_t len) {
     if (s == NULL) return NULL;
 
     /* Make sure added region doesn't contain garbage */
+    /* clean the new memory (init 0) */
     memset(s+curlen,0,(len-curlen+1)); /* also set trailing \0 byte */
     sdssetlen(s, len);
     return s;
@@ -423,6 +447,7 @@ sds sdscatsds(sds s, const sds t) {
 
 /* Destructively modify the sds string 's' to hold the specified binary
  * safe string pointed by 't' of length 'len' bytes. */
+/* enlarge sds and set sds with *t */
 sds sdscpylen(sds s, const char *t, size_t len) {
     if (sdsalloc(s) < len) {
         s = sdsMakeRoomFor(s,len-sdslen(s));
@@ -446,6 +471,7 @@ sds sdscpy(sds s, const char *t) {
  *
  * The function returns the length of the null-terminated string
  * representation stored at 's'. */
+/* longlong to string */
 #define SDS_LLSTR_SIZE 21
 int sdsll2str(char *s, long long value) {
     char *p, aux;
@@ -535,6 +561,7 @@ sds sdscatvprintf(sds s, const char *fmt, va_list ap) {
 
     /* Try with buffers two times bigger every time we fail to
      * fit the string in the current buffer size. */
+    /* expand buf when it is not enough */
     while(1) {
         buf[buflen-2] = '\0';
         va_copy(cpy,ap);

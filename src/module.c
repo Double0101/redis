@@ -29,7 +29,6 @@
 
 #include "server.h"
 #include "cluster.h"
-#include "rdb.h"
 #include <dlfcn.h>
 
 #define REDISMODULE_CORE 1
@@ -734,7 +733,6 @@ int RM_CreateCommand(RedisModuleCtx *ctx, const char *name, RedisModuleCmdFunc c
     cp->rediscmd->calls = 0;
     dictAdd(server.commands,sdsdup(cmdname),cp->rediscmd);
     dictAdd(server.orig_commands,sdsdup(cmdname),cp->rediscmd);
-    cp->rediscmd->id = ACLGetCommandID(cmdname); /* ID used for ACL. */
     return REDISMODULE_OK;
 }
 
@@ -1178,10 +1176,10 @@ int RM_ReplyWithArray(RedisModuleCtx *ctx, long len) {
         ctx->postponed_arrays = zrealloc(ctx->postponed_arrays,sizeof(void*)*
                 (ctx->postponed_arrays_count+1));
         ctx->postponed_arrays[ctx->postponed_arrays_count] =
-            addReplyDeferredLen(c);
+            addDeferredMultiBulkLength(c);
         ctx->postponed_arrays_count++;
     } else {
-        addReplyArrayLen(c,len);
+        addReplyMultiBulkLen(c,len);
     }
     return REDISMODULE_OK;
 }
@@ -1224,7 +1222,7 @@ void RM_ReplySetArrayLength(RedisModuleCtx *ctx, long len) {
             return;
     }
     ctx->postponed_arrays_count--;
-    setDeferredArrayLen(c,
+    setDeferredMultiBulkLength(c,
             ctx->postponed_arrays[ctx->postponed_arrays_count],
             len);
     if (ctx->postponed_arrays_count == 0) {
@@ -1240,17 +1238,6 @@ int RM_ReplyWithStringBuffer(RedisModuleCtx *ctx, const char *buf, size_t len) {
     client *c = moduleGetReplyClient(ctx);
     if (c == NULL) return REDISMODULE_OK;
     addReplyBulkCBuffer(c,(char*)buf,len);
-    return REDISMODULE_OK;
-}
-
-/* Reply with a bulk string, taking in input a C buffer pointer that is
- * assumed to be null-terminated.
- *
- * The function always returns REDISMODULE_OK. */
-int RM_ReplyWithCString(RedisModuleCtx *ctx, const char *buf) {
-    client *c = moduleGetReplyClient(ctx);
-    if (c == NULL) return REDISMODULE_OK;
-    addReplyBulkCString(c,(char*)buf);
     return REDISMODULE_OK;
 }
 
@@ -1271,7 +1258,7 @@ int RM_ReplyWithString(RedisModuleCtx *ctx, RedisModuleString *str) {
 int RM_ReplyWithNull(RedisModuleCtx *ctx) {
     client *c = moduleGetReplyClient(ctx);
     if (c == NULL) return REDISMODULE_OK;
-    addReplyNull(c);
+    addReply(c,shared.nullbulk);
     return REDISMODULE_OK;
 }
 
@@ -1466,9 +1453,6 @@ int RM_GetContextFlags(RedisModuleCtx *ctx) {
 
     if (server.cluster_enabled)
         flags |= REDISMODULE_CTX_FLAGS_CLUSTER;
-
-    if (server.loading)
-        flags |= REDISMODULE_CTX_FLAGS_LOADING;
 
     /* Maxmemory and eviction policy */
     if (server.maxmemory > 0) {
@@ -2765,7 +2749,6 @@ RedisModuleCallReply *RM_Call(RedisModuleCtx *ctx, const char *cmdname, const ch
     /* Create the client and dispatch the command. */
     va_start(ap, fmt);
     c = createClient(-1);
-    c->user = NULL; /* Root user. */
     argv = moduleCreateArgvFromUserFormat(cmdname,fmt,&argc,&flags,ap);
     replicate = flags & REDISMODULE_ARGV_REPLICATE;
     va_end(ap);
@@ -3079,11 +3062,6 @@ moduleType *RM_CreateDataType(RedisModuleCtx *ctx, const char *name, int encver,
         moduleTypeMemUsageFunc mem_usage;
         moduleTypeDigestFunc digest;
         moduleTypeFreeFunc free;
-        struct {
-            moduleTypeAuxLoadFunc aux_load;
-            moduleTypeAuxSaveFunc aux_save;
-            int aux_save_triggers;
-        } v2;
     } *tms = (struct typemethods*) typemethods_ptr;
 
     moduleType *mt = zcalloc(sizeof(*mt));
@@ -3095,11 +3073,6 @@ moduleType *RM_CreateDataType(RedisModuleCtx *ctx, const char *name, int encver,
     mt->mem_usage = tms->mem_usage;
     mt->digest = tms->digest;
     mt->free = tms->free;
-    if (tms->version >= 2) {
-        mt->aux_load = tms->v2.aux_load;
-        mt->aux_save = tms->v2.aux_save;
-        mt->aux_save_triggers = tms->v2.aux_save_triggers;
-    }
     memcpy(mt->name,name,sizeof(mt->name));
     listAddNodeTail(ctx->module->types,mt);
     return mt;
@@ -3366,36 +3339,6 @@ loaderr:
     return 0; /* Never reached. */
 }
 
-/* Iterate over modules, and trigger rdb aux saving for the ones modules types
- * who asked for it. */
-ssize_t rdbSaveModulesAux(rio *rdb, int when) {
-    size_t total_written = 0;
-    dictIterator *di = dictGetIterator(modules);
-    dictEntry *de;
-
-    while ((de = dictNext(di)) != NULL) {
-        struct RedisModule *module = dictGetVal(de);
-        listIter li;
-        listNode *ln;
-
-        listRewind(module->types,&li);
-        while((ln = listNext(&li))) {
-            moduleType *mt = ln->value;
-            if (!mt->aux_save || !(mt->aux_save_triggers & when))
-                continue;
-            ssize_t ret = rdbSaveSingleModuleAux(rdb, when, mt);
-            if (ret==-1) {
-                dictReleaseIterator(di);
-                return -1;
-            }
-            total_written += ret;
-        }
-    }
-
-    dictReleaseIterator(di);
-    return total_written;
-}
-
 /* --------------------------------------------------------------------------
  * Key digest API (DEBUG DIGEST interface for modules types)
  * -------------------------------------------------------------------------- */
@@ -3556,7 +3499,7 @@ void RM_LogRaw(RedisModule *module, const char *levelstr, const char *fmt, va_li
 
     if (level < server.verbosity) return;
 
-    name_len = snprintf(msg, sizeof(msg),"<%s> ", module? module->name: "module");
+    name_len = snprintf(msg, sizeof(msg),"<%s> ", module->name);
     vsnprintf(msg + name_len, sizeof(msg) - name_len, fmt, ap);
     serverLogRaw(level,msg);
 }
@@ -3574,15 +3517,13 @@ void RM_LogRaw(RedisModule *module, const char *levelstr, const char *fmt, va_li
  * There is a fixed limit to the length of the log line this function is able
  * to emit, this limit is not specified but is guaranteed to be more than
  * a few lines of text.
- *
- * The ctx argument may be NULL if cannot be provided in the context of the
- * caller for instance threads or callbacks, in which case a generic "module"
- * will be used instead of the module name.
  */
 void RM_Log(RedisModuleCtx *ctx, const char *levelstr, const char *fmt, ...) {
+    if (!ctx->module) return;   /* Can only log if module is initialized */
+
     va_list ap;
     va_start(ap, fmt);
-    RM_LogRaw(ctx? ctx->module: NULL,levelstr,fmt,ap);
+    RM_LogRaw(ctx->module,levelstr,fmt,ap);
     va_end(ap);
 }
 
@@ -5115,7 +5056,6 @@ void moduleInitModulesSystem(void) {
     moduleKeyspaceSubscribers = listCreate();
     moduleFreeContextReusedClient = createClient(-1);
     moduleFreeContextReusedClient->flags |= CLIENT_MODULE;
-    moduleFreeContextReusedClient->user = NULL; /* root user. */
 
     /* Set up filter list */
     moduleCommandFilters = listCreate();
@@ -5285,25 +5225,6 @@ int moduleUnload(sds name) {
     return REDISMODULE_OK;
 }
 
-/* Helper function for the MODULE and HELLO command: send the list of the
- * loaded modules to the client. */
-void addReplyLoadedModules(client *c) {
-    dictIterator *di = dictGetIterator(modules);
-    dictEntry *de;
-
-    addReplyArrayLen(c,dictSize(modules));
-    while ((de = dictNext(di)) != NULL) {
-        sds name = dictGetKey(de);
-        struct RedisModule *module = dictGetVal(de);
-        addReplyMapLen(c,2);
-        addReplyBulkCString(c,"name");
-        addReplyBulkCBuffer(c,name,sdslen(name));
-        addReplyBulkCString(c,"ver");
-        addReplyLongLong(c,module->ver);
-    }
-    dictReleaseIterator(di);
-}
-
 /* Redis MODULE command.
  *
  * MODULE LOAD <path> [args...] */
@@ -5356,7 +5277,20 @@ NULL
             addReplyErrorFormat(c,"Error unloading module: %s",errmsg);
         }
     } else if (!strcasecmp(subcmd,"list") && c->argc == 2) {
-        addReplyLoadedModules(c);
+        dictIterator *di = dictGetIterator(modules);
+        dictEntry *de;
+
+        addReplyMultiBulkLen(c,dictSize(modules));
+        while ((de = dictNext(di)) != NULL) {
+            sds name = dictGetKey(de);
+            struct RedisModule *module = dictGetVal(de);
+            addReplyMultiBulkLen(c,4);
+            addReplyBulkCString(c,"name");
+            addReplyBulkCBuffer(c,name,sdslen(name));
+            addReplyBulkCString(c,"ver");
+            addReplyLongLong(c,module->ver);
+        }
+        dictReleaseIterator(di);
     } else {
         addReplySubcommandSyntaxError(c);
         return;

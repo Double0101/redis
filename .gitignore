@@ -1,4 +1,6 @@
 .*.swp
+cmake-build-debug/
+.idea/
 *.o
 *.log
 dump.rdb

@@ -83,7 +83,6 @@ robj *lookupKey(redisDb *db, robj *key, int flags) {
  * 1. A key gets expired if it reached it's TTL.
  * 2. The key last access time is updated.
  * 3. The global keys hits/misses stats are updated (reported in INFO).
- * 4. If keyspace notifications are enabled, a "keymiss" notification is fired.
  *
  * This API should not be used when we write to the key after obtaining
  * the object linked to the key, but only for read only operations.
@@ -107,7 +106,6 @@ robj *lookupKeyReadWithFlags(redisDb *db, robj *key, int flags) {
          * to return NULL ASAP. */
         if (server.masterhost == NULL) {
             server.stat_keyspace_misses++;
-            notifyKeyspaceEvent(NOTIFY_KEY_MISS, "keymiss", key, db->id);
             return NULL;
         }
 
@@ -129,15 +127,12 @@ robj *lookupKeyReadWithFlags(redisDb *db, robj *key, int flags) {
             server.current_client->cmd->flags & CMD_READONLY)
         {
             server.stat_keyspace_misses++;
-            notifyKeyspaceEvent(NOTIFY_KEY_MISS, "keymiss", key, db->id);
             return NULL;
         }
     }
     val = lookupKey(db,key,flags);
-    if (val == NULL) {
+    if (val == NULL)
         server.stat_keyspace_misses++;
-        notifyKeyspaceEvent(NOTIFY_KEY_MISS, "keymiss", key, db->id);
-    }
     else
         server.stat_keyspace_hits++;
     return val;
@@ -246,7 +241,7 @@ robj *dbRandomKey(redisDb *db) {
         sds key;
         robj *keyobj;
 
-        de = dictGetFairRandomKey(db->dict);
+        de = dictGetRandomKey(db->dict);
         if (de == NULL) return NULL;
 
         key = dictGetKey(de);
@@ -344,7 +339,7 @@ robj *dbUnshareStringValue(redisDb *db, robj *key, robj *o) {
  * On success the fuction returns the number of keys removed from the
  * database(s). Otherwise -1 is returned in the specific case the
  * DB number is out of range, and errno is set to EINVAL. */
-long long emptyDbGeneric(redisDb *dbarray, int dbnum, int flags, void(callback)(void*)) {
+long long emptyDb(int dbnum, int flags, void(callback)(void*)) {
     int async = (flags & EMPTYDB_ASYNC);
     long long removed = 0;
 
@@ -352,11 +347,6 @@ long long emptyDbGeneric(redisDb *dbarray, int dbnum, int flags, void(callback)(
         errno = EINVAL;
         return -1;
     }
-
-    /* Make sure the WATCHed keys are affected by the FLUSH* commands.
-     * Note that we need to call the function while the keys are still
-     * there. */
-    signalFlushedDb(dbnum);
 
     int startdb, enddb;
     if (dbnum == -1) {
@@ -367,12 +357,12 @@ long long emptyDbGeneric(redisDb *dbarray, int dbnum, int flags, void(callback)(
     }
 
     for (int j = startdb; j <= enddb; j++) {
-        removed += dictSize(dbarray[j].dict);
+        removed += dictSize(server.db[j].dict);
         if (async) {
-            emptyDbAsync(&dbarray[j]);
+            emptyDbAsync(&server.db[j]);
         } else {
-            dictEmpty(dbarray[j].dict,callback);
-            dictEmpty(dbarray[j].expires,callback);
+            dictEmpty(server.db[j].dict,callback);
+            dictEmpty(server.db[j].expires,callback);
         }
     }
     if (server.cluster_enabled) {
@@ -386,24 +376,11 @@ long long emptyDbGeneric(redisDb *dbarray, int dbnum, int flags, void(callback)(
     return removed;
 }
 
-long long emptyDb(int dbnum, int flags, void(callback)(void*)) {
-    return emptyDbGeneric(server.db, dbnum, flags, callback);
-}
-
 int selectDb(client *c, int id) {
     if (id < 0 || id >= server.dbnum)
         return C_ERR;
     c->db = &server.db[id];
     return C_OK;
-}
-
-long long dbTotalServerKeyCount() {
-    long long total = 0;
-    int j;
-    for (j = 0; j < server.dbnum; j++) {
-        total += dictSize(server.db[j].dict);
-    }
-    return total;
 }
 
 /*-----------------------------------------------------------------------------
@@ -417,12 +394,10 @@ long long dbTotalServerKeyCount() {
 
 void signalModifiedKey(redisDb *db, robj *key) {
     touchWatchedKey(db,key);
-    trackingInvalidateKey(key);
 }
 
 void signalFlushedDb(int dbid) {
     touchWatchedKeysOnFlush(dbid);
-    trackingInvalidateKeysOnFlush(dbid);
 }
 
 /*-----------------------------------------------------------------------------
@@ -458,6 +433,7 @@ void flushdbCommand(client *c) {
     int flags;
 
     if (getFlushCommandFlags(c,&flags) == C_ERR) return;
+    signalFlushedDb(c->db->id);
     server.dirty += emptyDb(c->db->id,flags,NULL);
     addReply(c,shared.ok);
 }
@@ -469,9 +445,13 @@ void flushallCommand(client *c) {
     int flags;
 
     if (getFlushCommandFlags(c,&flags) == C_ERR) return;
+    signalFlushedDb(-1);
     server.dirty += emptyDb(-1,flags,NULL);
     addReply(c,shared.ok);
-    if (server.rdb_child_pid != -1) killRDBChild();
+    if (server.rdb_child_pid != -1) {
+        kill(server.rdb_child_pid,SIGUSR1);
+        rdbRemoveTempFile(server.rdb_child_pid);
+    }
     if (server.saveparamslen > 0) {
         /* Normally rdbSave() will reset dirty, but we don't want this here
          * as otherwise FLUSHALL will not be replicated nor put into the AOF. */
@@ -545,7 +525,7 @@ void randomkeyCommand(client *c) {
     robj *key;
 
     if ((key = dbRandomKey(c->db)) == NULL) {
-        addReplyNull(c);
+        addReply(c,shared.nullbulk);
         return;
     }
 
@@ -559,7 +539,7 @@ void keysCommand(client *c) {
     sds pattern = c->argv[1]->ptr;
     int plen = sdslen(pattern), allkeys;
     unsigned long numkeys = 0;
-    void *replylen = addReplyDeferredLen(c);
+    void *replylen = addDeferredMultiBulkLength(c);
 
     di = dictGetSafeIterator(c->db->dict);
     allkeys = (pattern[0] == '*' && pattern[1] == '\0');
@@ -577,7 +557,7 @@ void keysCommand(client *c) {
         }
     }
     dictReleaseIterator(di);
-    setDeferredArrayLen(c,replylen,numkeys);
+    setDeferredMultiBulkLength(c,replylen,numkeys);
 }
 
 /* This callback is used by scanGenericCommand in order to collect elements
@@ -631,7 +611,7 @@ int parseScanCursorOrReply(client *c, robj *o, unsigned long *cursor) {
 }
 
 /* This command implements SCAN, HSCAN and SSCAN commands.
- * If object 'o' is passed, then it must be a Hash, Set or Zset object, otherwise
+ * If object 'o' is passed, then it must be a Hash or Set object, otherwise
  * if 'o' is NULL the command will operate on the dictionary associated with
  * the current database.
  *
@@ -647,7 +627,6 @@ void scanGenericCommand(client *c, robj *o, unsigned long cursor) {
     listNode *node, *nextnode;
     long count = 10;
     sds pat = NULL;
-    sds typename = NULL;
     int patlen = 0, use_pattern = 0;
     dict *ht;
 
@@ -684,10 +663,6 @@ void scanGenericCommand(client *c, robj *o, unsigned long cursor) {
             use_pattern = !(pat[0] == '*' && patlen == 1);
 
             i += 2;
-        } else if (!strcasecmp(c->argv[i]->ptr, "type") && o == NULL && j >= 2) {
-            /* SCAN for a particular type only applies to the db dict */
-            typename = c->argv[i+1]->ptr;
-            i+= 2;
         } else {
             addReply(c,shared.syntaxerr);
             goto cleanup;
@@ -782,13 +757,6 @@ void scanGenericCommand(client *c, robj *o, unsigned long cursor) {
             }
         }
 
-        /* Filter an element if it isn't the type we want. */
-        if (!filter && o == NULL && typename){
-            robj* typecheck = lookupKeyReadWithFlags(c->db, kobj, LOOKUP_NOTOUCH);
-            char* type = getObjectTypeName(typecheck);
-            if (strcasecmp((char*) typename, type)) filter = 1;
-        }
-
         /* Filter element if it is an expired key. */
         if (!filter && o == NULL && expireIfNeeded(c->db, kobj)) filter = 1;
 
@@ -814,10 +782,10 @@ void scanGenericCommand(client *c, robj *o, unsigned long cursor) {
     }
 
     /* Step 4: Reply to the client. */
-    addReplyArrayLen(c, 2);
+    addReplyMultiBulkLen(c, 2);
     addReplyBulkLongLong(c,cursor);
 
-    addReplyArrayLen(c, listLength(keys));
+    addReplyMultiBulkLen(c, listLength(keys));
     while ((node = listFirst(keys)) != NULL) {
         robj *kobj = listNodeValue(node);
         addReplyBulk(c, kobj);
@@ -845,8 +813,11 @@ void lastsaveCommand(client *c) {
     addReplyLongLong(c,server.lastsave);
 }
 
-char* getObjectTypeName(robj *o) {
-    char* type;
+void typeCommand(client *c) {
+    robj *o;
+    char *type;
+
+    o = lookupKeyReadWithFlags(c->db,c->argv[1],LOOKUP_NOTOUCH);
     if (o == NULL) {
         type = "none";
     } else {
@@ -864,13 +835,7 @@ char* getObjectTypeName(robj *o) {
         default: type = "unknown"; break;
         }
     }
-    return type;
-}
-
-void typeCommand(client *c) {
-    robj *o;
-    o = lookupKeyReadWithFlags(c->db,c->argv[1],LOOKUP_NOTOUCH);
-    addReplyStatus(c, getObjectTypeName(o));
+    addReplyStatus(c,type);
 }
 
 void shutdownCommand(client *c) {
@@ -1032,7 +997,7 @@ void scanDatabaseForReadyLists(redisDb *db) {
  *
  * Returns C_ERR if at least one of the DB ids are out of range, otherwise
  * C_OK is returned. */
-int dbSwapDatabases(long id1, long id2) {
+int dbSwapDatabases(int id1, int id2) {
     if (id1 < 0 || id1 >= server.dbnum ||
         id2 < 0 || id2 >= server.dbnum) return C_ERR;
     if (id1 == id2) return C_OK;

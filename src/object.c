@@ -467,15 +467,10 @@ robj *tryObjectEncoding(robj *o) {
             incrRefCount(shared.integers[value]);
             return shared.integers[value];
         } else {
-            if (o->encoding == OBJ_ENCODING_RAW) {
-                sdsfree(o->ptr);
-                o->encoding = OBJ_ENCODING_INT;
-                o->ptr = (void*) value;
-                return o;
-            } else if (o->encoding == OBJ_ENCODING_EMBSTR) {
-                decrRefCount(o);
-                return createStringObjectFromLongLongForValue(value);
-            }
+            if (o->encoding == OBJ_ENCODING_RAW) sdsfree(o->ptr);
+            o->encoding = OBJ_ENCODING_INT;
+            o->ptr = (void*) value;
+            return o;
         }
     }
 
@@ -839,9 +834,7 @@ size_t objectComputeSize(robj *o, size_t sample_size) {
             d = ((zset*)o->ptr)->dict;
             zskiplist *zsl = ((zset*)o->ptr)->zsl;
             zskiplistNode *znode = zsl->header->level[0].forward;
-            asize = sizeof(*o)+sizeof(zset)+sizeof(zskiplist)+sizeof(dict)+
-                    (sizeof(struct dictEntry*)*dictSlots(d))+
-                    zmalloc_size(zsl->header);
+            asize = sizeof(*o)+sizeof(zset)+(sizeof(struct dictEntry*)*dictSlots(d));
             while(znode != NULL && samples < sample_size) {
                 elesize += sdsAllocSize(znode->ele);
                 elesize += sizeof(struct dictEntry) + zmalloc_size(znode);
@@ -1267,15 +1260,15 @@ NULL
         };
         addReplyHelp(c, help);
     } else if (!strcasecmp(c->argv[1]->ptr,"refcount") && c->argc == 3) {
-        if ((o = objectCommandLookupOrReply(c,c->argv[2],shared.null[c->resp]))
+        if ((o = objectCommandLookupOrReply(c,c->argv[2],shared.nullbulk))
                 == NULL) return;
         addReplyLongLong(c,o->refcount);
     } else if (!strcasecmp(c->argv[1]->ptr,"encoding") && c->argc == 3) {
-        if ((o = objectCommandLookupOrReply(c,c->argv[2],shared.null[c->resp]))
+        if ((o = objectCommandLookupOrReply(c,c->argv[2],shared.nullbulk))
                 == NULL) return;
         addReplyBulkCString(c,strEncoding(o->encoding));
     } else if (!strcasecmp(c->argv[1]->ptr,"idletime") && c->argc == 3) {
-        if ((o = objectCommandLookupOrReply(c,c->argv[2],shared.null[c->resp]))
+        if ((o = objectCommandLookupOrReply(c,c->argv[2],shared.nullbulk))
                 == NULL) return;
         if (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) {
             addReplyError(c,"An LFU maxmemory policy is selected, idle time not tracked. Please note that when switching between policies at runtime LRU and LFU data will take some time to adjust.");
@@ -1283,7 +1276,7 @@ NULL
         }
         addReplyLongLong(c,estimateObjectIdleTime(o)/1000);
     } else if (!strcasecmp(c->argv[1]->ptr,"freq") && c->argc == 3) {
-        if ((o = objectCommandLookupOrReply(c,c->argv[2],shared.null[c->resp]))
+        if ((o = objectCommandLookupOrReply(c,c->argv[2],shared.nullbulk))
                 == NULL) return;
         if (!(server.maxmemory_policy & MAXMEMORY_FLAG_LFU)) {
             addReplyError(c,"An LFU maxmemory policy is not selected, access frequency not tracked. Please note that when switching between policies at runtime LRU and LFU data will take some time to adjust.");
@@ -1335,7 +1328,7 @@ NULL
             }
         }
         if ((de = dictFind(c->db->dict,c->argv[2]->ptr)) == NULL) {
-            addReplyNull(c);
+            addReply(c, shared.nullbulk);
             return;
         }
         size_t usage = objectComputeSize(dictGetVal(de),samples);
@@ -1345,7 +1338,7 @@ NULL
     } else if (!strcasecmp(c->argv[1]->ptr,"stats") && c->argc == 2) {
         struct redisMemOverhead *mh = getMemoryOverheadData();
 
-        addReplyMapLen(c,25+mh->num_dbs);
+        addReplyMultiBulkLen(c,(25+mh->num_dbs)*2);
 
         addReplyBulkCString(c,"peak.allocated");
         addReplyLongLong(c,mh->peak_allocated);
@@ -1375,7 +1368,7 @@ NULL
             char dbname[32];
             snprintf(dbname,sizeof(dbname),"db.%zd",mh->db[j].dbid);
             addReplyBulkCString(c,dbname);
-            addReplyMapLen(c,2);
+            addReplyMultiBulkLen(c,4);
 
             addReplyBulkCString(c,"overhead.hashtable.main");
             addReplyLongLong(c,mh->db[j].overhead_ht_main);

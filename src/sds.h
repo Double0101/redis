@@ -42,30 +42,40 @@ const char *SDS_NOINIT;
 
 typedef char *sds;
 
+/**
+ * As a special case, the last element of a structure with more than one named member may have an incomplete array type;
+ * this is called a flexible array member. In most situations, the flexible array member is ignored.
+ * url: https://stackoverflow.com/questions/36577094/array-of-size-0-at-the-end-of-struct
+ */
 /* Note: sdshdr5 is never used, we just access the flags byte directly.
  * However is here to document the layout of type 5 SDS strings. */
+/* length < 1<<5 */
 struct __attribute__ ((__packed__)) sdshdr5 {
     unsigned char flags; /* 3 lsb of type, and 5 msb of string length */
     char buf[];
 };
+/* length < 1<<8 */
 struct __attribute__ ((__packed__)) sdshdr8 {
     uint8_t len; /* used */
     uint8_t alloc; /* excluding the header and null terminator */
     unsigned char flags; /* 3 lsb of type, 5 unused bits */
     char buf[];
 };
+/* length < 1<<16 */
 struct __attribute__ ((__packed__)) sdshdr16 {
     uint16_t len; /* used */
     uint16_t alloc; /* excluding the header and null terminator */
     unsigned char flags; /* 3 lsb of type, 5 unused bits */
     char buf[];
 };
+/* length < 1<<32 */
 struct __attribute__ ((__packed__)) sdshdr32 {
     uint32_t len; /* used */
     uint32_t alloc; /* excluding the header and null terminator */
     unsigned char flags; /* 3 lsb of type, 5 unused bits */
     char buf[];
 };
+/* length > 1<<32 */
 struct __attribute__ ((__packed__)) sdshdr64 {
     uint64_t len; /* used */
     uint64_t alloc; /* excluding the header and null terminator */
@@ -80,6 +90,7 @@ struct __attribute__ ((__packed__)) sdshdr64 {
 #define SDS_TYPE_64 4
 #define SDS_TYPE_MASK 7
 #define SDS_TYPE_BITS 3
+//  SDS_HDR_VAR(5, 64) -> struct sdshdr5 *sh = (void*) ((64) - sizeof(struct sdshdr5))
 #define SDS_HDR_VAR(T,s) struct sdshdr##T *sh = (void*)((s)-(sizeof(struct sdshdr##T)));
 #define SDS_HDR(T,s) ((struct sdshdr##T *)((s)-(sizeof(struct sdshdr##T))))
 #define SDS_TYPE_5_LEN(f) ((f)>>SDS_TYPE_BITS)
@@ -127,6 +138,11 @@ static inline size_t sdsavail(const sds s) {
     return 0;
 }
 
+/**
+ * set sds len
+ * @param s
+ * @param newlen
+ */
 static inline void sdssetlen(sds s, size_t newlen) {
     unsigned char flags = s[-1];
     switch(flags&SDS_TYPE_MASK) {
@@ -151,6 +167,11 @@ static inline void sdssetlen(sds s, size_t newlen) {
     }
 }
 
+/**
+ * increase sds len
+ * @param s
+ * @param inc
+ */
 static inline void sdsinclen(sds s, size_t inc) {
     unsigned char flags = s[-1];
     switch(flags&SDS_TYPE_MASK) {

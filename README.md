@@ -166,8 +166,6 @@ for Ubuntu and Debian systems:
     % cd utils
     % ./install_server.sh
 
-_Note_: `install_server.sh` will not work on Mac OSX; it is built for Linux only.
-
 The script will ask you a few questions and will setup everything you need
 to run Redis properly as a background daemon that will start again on
 system reboots.
@@ -218,7 +216,7 @@ Inside the root are the following important directories:
 
 * `src`: contains the Redis implementation, written in C.
 * `tests`: contains the unit tests, implemented in Tcl.
-* `deps`: contains libraries Redis uses. Everything needed to compile Redis is inside this directory; your system just needs to provide `libc`, a POSIX compatible interface and a C compiler. Notably `deps` contains a copy of `jemalloc`, which is the default allocator of Redis under Linux. Note that under `deps` there are also things which started with the Redis project, but for which the main repository is not `antirez/redis`.
+* `deps`: contains libraries Redis uses. Everything needed to compile Redis is inside this directory; your system just needs to provide `libc`, a POSIX compatible interface and a C compiler. Notably `deps` contains a copy of `jemalloc`, which is the default allocator of Redis under Linux. Note that under `deps` there are also things which started with the Redis project, but for which the main repository is not `antirez/redis`. An exception to this rule is `deps/geohash-int` which is the low level geocoding library used by Redis: it originated from a different project, but at this point it diverged so much that it is developed as a separated entity directly inside the Redis repository.
 
 There are a few more directories but they are not very important for our goals
 here. We'll focus mostly on `src`, where the Redis implementation is contained,
@@ -406,7 +404,7 @@ replicas, or to continue the replication after a disconnection.
 Other C files
 ---
 
-* `t_hash.c`, `t_list.c`, `t_set.c`, `t_string.c`, `t_zset.c` and `t_stream.c` contains the implementation of the Redis data types. They implement both an API to access a given data type, and the client commands implementations for these data types.
+* `t_hash.c`, `t_list.c`, `t_set.c`, `t_string.c` and `t_zset.c` contains the implementation of the Redis data types. They implement both an API to access a given data type, and the client commands implementations for these data types.
 * `ae.c` implements the Redis event loop, it's a self contained library which is simple to read and understand.
 * `sds.c` is the Redis string library, check http://github.com/antirez/sds for more information.
 * `anet.c` is a library to use POSIX networking in a simpler way compared to the raw interface exposed by the kernel.
