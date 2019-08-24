@@ -561,6 +561,7 @@ sds sdscatvprintf(sds s, const char *fmt, va_list ap) {
 
     /* Try with buffers two times bigger every time we fail to
      * fit the string in the current buffer size. */
+    /* expand buf when it is not enough */
     while(1) {
         buf[buflen-2] = '\0';
         va_copy(cpy,ap);
