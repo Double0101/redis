@@ -53,6 +53,7 @@ list *listCreate(void)
 }
 
 /* Remove all the elements from the list without destroying the list itself. */
+/* clear list */
 void listEmpty(list *list)
 {
     unsigned long len;
@@ -131,6 +132,10 @@ list *listAddNodeTail(list *list, void *value)
     return list;
 }
 
+/*
+ * if after > 0 insert value after old_node
+ * if after <= 0 insert value before old_node
+ */
 list *listInsertNode(list *list, listNode *old_node, void *value, int after) {
     listNode *node;
 
@@ -164,6 +169,7 @@ list *listInsertNode(list *list, listNode *old_node, void *value, int after) {
  * It's up to the caller to free the private value of the node.
  *
  * This function can't fail. */
+/* remove node from list but you must confirm node is a part of list */
 void listDelNode(list *list, listNode *node)
 {
     if (node->prev)
@@ -183,6 +189,7 @@ void listDelNode(list *list, listNode *node)
  * call to listNext() will return the next element of the list.
  *
  * This function can't fail. */
+/* init list iterator */
 listIter *listGetIterator(list *list, int direction)
 {
     listIter *iter;
@@ -287,6 +294,7 @@ list *listDup(list *orig)
  * On success the first matching node pointer is returned
  * (search starts from head). If no matching node exists
  * NULL is returned. */
+/* search node which value equals key */
 listNode *listSearchKey(list *list, void *key)
 {
     listIter iter;
@@ -357,6 +365,7 @@ void listJoin(list *l, list *o) {
     l->len += o->len;
 
     /* Setup other as an empty list. */
+    /* wild pointer prevention */
     o->head = o->tail = NULL;
     o->len = 0;
 }
