@@ -176,8 +176,9 @@ int dictExpand(dict *d, unsigned long size)
     return DICT_OK;
 }
 
-/* Performs N steps of incremental rehashing. Returns 1 if there are still
- * keys to move from the old to the new hash table, otherwise 0 is returned.
+/* Performs N steps of incremental rehashing.
+ *
+ * Returns 1 if there are still keys to move from the old to the new hash table, otherwise 0 is returned.
  *
  * Note that a rehashing step consists in moving a bucket (that may have more
  * than one key as we use chaining) from the old to the new hash table, however
@@ -206,11 +207,14 @@ int dictRehash(dict *d, int n) {
 
             nextde = de->next;
             /* Get the index in the new hash table */
+            /* save de into d->ht[1].table[h]
+             * save original d->ht[1].table[h] into de->next */
             h = dictHashKey(d, de->key) & d->ht[1].sizemask;
             de->next = d->ht[1].table[h];
             d->ht[1].table[h] = de;
             d->ht[0].used--;
             d->ht[1].used++;
+
             de = nextde;
         }
         d->ht[0].table[d->rehashidx] = NULL;
@@ -242,10 +246,12 @@ int dictRehashMilliseconds(dict *d, int ms) {
     long long start = timeInMilliseconds();
     int rehashes = 0;
 
+    /* if function dictRehash return 0 rehash completed */
     while(dictRehash(d,100)) {
         rehashes += 100;
         if (timeInMilliseconds()-start > ms) break;
     }
+    /* about (count of NULL / 10) */
     return rehashes;
 }
 
