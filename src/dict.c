@@ -973,6 +973,7 @@ static long _dictKeyIndex(dict *d, const void *key, uint64_t hash, dictEntry **e
     if (existing) *existing = NULL;
 
     /* Expand the hash table if needed */
+    /* if dic expand fail return -1 */
     if (_dictExpandIfNeeded(d) == DICT_ERR)
         return -1;
     for (table = 0; table <= 1; table++) {
