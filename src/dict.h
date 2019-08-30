@@ -57,8 +57,8 @@ typedef struct dictEntry {
 
 typedef struct dictType {
     uint64_t (*hashFunction)(const void *key);
-    void *(*keyDup)(void *privdata, const void *key);
-    void *(*valDup)(void *privdata, const void *obj);
+    void *(*keyDup)(void *privdata, const void *key);   /* duplicate key */
+    void *(*valDup)(void *privdata, const void *obj);   /* duplicate value */
     int (*keyCompare)(void *privdata, const void *key1, const void *key2);
     void (*keyDestructor)(void *privdata, void *key);
     void (*valDestructor)(void *privdata, void *obj);
